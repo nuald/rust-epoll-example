@@ -2,8 +2,14 @@
 name = "rust-epoll-example"
 version = "0.1.0"
 authors = ["Mario Zupan <mario@zupzup.org>"]
-edition = "2018"
+edition = "2021"
 
+[lints]
+rust = { warnings = "deny" }
+clippy = { pedantic = "warn" }
 
 [dependencies]
 libc = "0.2"
+
+[profile.release]
+debug = true
