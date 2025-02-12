@@ -1,9 +1,14 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::rc::Rc;
+use std::collections::VecDeque;
+
+pub mod actor;
 
 #[allow(unused_macros)]
 macro_rules! syscall {
@@ -15,6 +20,11 @@ macro_rules! syscall {
             Ok(res)
         }
     }};
+}
+
+trait EventReceiver {
+    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()>;
+    fn on_write(&mut self, new_actions: &mut InterestActions) -> io::Result<()>;
 }
 
 #[derive(Debug)]
@@ -33,31 +43,6 @@ impl RequestContext {
             content_length: 0,
             verbose,
         }
-    }
-
-    fn read_cb(&mut self, key: u64, epoll_fd: RawFd) -> io::Result<()> {
-        let mut buf = [0u8; 4096];
-        match self.stream.read(&mut buf) {
-            Ok(_) => {
-                if let Ok(data) = std::str::from_utf8(&buf) {
-                    self.parse_and_set_content_length(data);
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => {
-                return Err(e);
-            }
-        };
-        self.buf.extend_from_slice(&buf);
-        if self.buf.len() >= self.content_length {
-            if self.verbose {
-                log(&format!("got all data: {} bytes", self.buf.len()));
-            }
-            modify_interest(epoll_fd, self.stream.as_raw_fd(), listener_write_event(key))?;
-        } else {
-            modify_interest(epoll_fd, self.stream.as_raw_fd(), listener_read_event(key))?;
-        }
-        Ok(())
     }
 
     fn parse_and_set_content_length(&mut self, data: &str) {
@@ -80,22 +65,41 @@ impl RequestContext {
             }
         }
     }
+}
 
-    fn write_cb(&mut self, key: u64, epoll_fd: RawFd) -> io::Result<()> {
-        match self.stream.write_all(HTTP_RESP) {
-            Ok(()) => {
-                if self.verbose {
-                    log(&format!("answered from request {key}"));
+impl EventReceiver for RequestContext {
+    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
+        let mut buf = [0u8; 4096];
+        match self.stream.read(&mut buf) {
+            Ok(_) => {
+                if let Ok(data) = std::str::from_utf8(&buf) {
+                    self.parse_and_set_content_length(data);
                 }
             }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => {
-                if self.verbose {
-                    log(&format!("could not answer to request {key}, {e}"));
-                }
+                return Err(e);
             }
         };
-        let fd = self.stream.as_raw_fd();
-        remove_interest(epoll_fd, fd)?;
+        self.buf.extend_from_slice(&buf);
+        if self.buf.len() >= self.content_length {
+            if self.verbose {
+                log(&format!("got all data: {} bytes", self.buf.len()));
+            }
+            new_actions.add(InterestAction::Modify(self.stream.as_raw_fd(), WRITE_FLAGS));
+        } else {
+            new_actions.add(InterestAction::Modify(self.stream.as_raw_fd(), READ_FLAGS));
+        }
+        Ok(())
+    }
+
+    fn on_write(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
+        if let Err(e) = self.stream.write_all(HTTP_RESP) {
+            if self.verbose {
+                log(&format!("could not answer: {e}"));
+            }
+        }
+        new_actions.add(InterestAction::Remove(self.stream.as_raw_fd()));
         Ok(())
     }
 }
@@ -114,6 +118,220 @@ fn log(msg: &str) {
     println!("{msg}");
 }
 
+enum InterestAction {
+    Add(RawFd, i32, Rc<RefCell<dyn EventReceiver>>),
+    Modify(RawFd, i32),
+    Remove(RawFd)
+}
+
+struct InterestActions {
+    actions: VecDeque<InterestAction>,
+}
+
+impl InterestActions {
+    fn new() -> Self {
+        Self {
+            actions: VecDeque::new(),
+        }
+    }
+
+    fn add(&mut self, action: InterestAction) {
+        self.actions.push_back(action);
+    }
+}
+
+impl Iterator for InterestActions {
+    type Item = InterestAction;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.actions.pop_front()
+    }
+}
+
+
+pub struct Reactor {
+    epoll_fd: RawFd,
+    receivers: HashMap<RawFd, Rc<RefCell<dyn EventReceiver>>>,
+}
+
+impl Reactor {
+    fn new() -> Self {
+        let epoll_fd = epoll_create().expect("can create epoll queue");
+        Self {
+            epoll_fd,
+            receivers: HashMap::new(),
+        }
+    }
+
+    fn add_interest(
+        &mut self,
+        fd: RawFd,
+        flags: i32,
+        receiver: Rc<RefCell<dyn EventReceiver>>,
+    ) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: flags as u32,
+            u64: fd as u64,
+        };
+        syscall!(epoll_ctl(
+            self.epoll_fd,
+            libc::EPOLL_CTL_ADD,
+            fd,
+            &mut event
+        ))?;
+        self.receivers.insert(fd, receiver);
+        Ok(())
+    }
+
+    fn modify_interest(&self, fd: RawFd, flags: i32) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: flags as u32,
+            u64: fd as u64,
+        };
+        syscall!(epoll_ctl(
+            self.epoll_fd,
+            libc::EPOLL_CTL_MOD,
+            fd,
+            &mut event
+        ))?;
+        Ok(())
+    }
+
+    fn remove_interest(&mut self, fd: RawFd) -> io::Result<()> {
+        syscall!(epoll_ctl(
+            self.epoll_fd,
+            libc::EPOLL_CTL_DEL,
+            fd,
+            std::ptr::null_mut()
+        ))?;
+        self.receivers.remove(&fd);
+        Ok(())
+    }
+
+    fn apply(&mut self, actions: InterestActions) -> io::Result<()> {
+        for action in actions {
+            match action {
+                InterestAction::Add(fd, flags, receiver) => self.add_interest(fd, flags, receiver)?,
+                InterestAction::Modify(fd, flags) => self.modify_interest(fd, flags)?,
+                InterestAction::Remove(fd) => self.remove_interest(fd)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn run(&mut self, verbose: bool) -> io::Result<()> {
+        let mut events: Vec<libc::epoll_event> = Vec::with_capacity(1024);
+        loop {
+            // TODO: avoid allocation in a loop
+            let mut interest_actions = InterestActions::new();
+            if verbose {
+                log(&format!("receivers in flight: {}", self.receivers.len()));
+            }
+            events.clear();
+            let res = match syscall!(epoll_wait(
+                self.epoll_fd,
+                events.as_mut_ptr(),
+                1024,
+                1000 as libc::c_int,
+            )) {
+                Ok(v) => v,
+                Err(e) => panic!("error during epoll wait: {e}"),
+            };
+
+            #[allow(clippy::cast_sign_loss)]
+            unsafe {
+                events.set_len(res as usize);
+            };
+
+            for ev in &events {
+                let fd = ev.u64 as RawFd;
+                #[allow(clippy::cast_possible_wrap)]
+                let events = ev.events as i32;
+                match events {
+                    v if v & libc::EPOLLIN == libc::EPOLLIN => match self.receivers.get(&fd) {
+                        Some(receiver) => {
+                            receiver.borrow_mut().on_read(&mut interest_actions)?;
+                        }
+                        None => {
+                            if verbose {
+                                log(&format!("unexpected fd {fd} for EPOLLIN"));
+                            }
+                        }
+                    },
+                    v if v & libc::EPOLLOUT == libc::EPOLLOUT => match self.receivers.get(&fd) {
+                        Some(receiver) => {
+                            receiver.borrow_mut().on_write(&mut interest_actions)?;
+                        }
+                        None => {
+                            if verbose {
+                                log(&format!("unexpected fd {fd} for EPOLLIN"));
+                            }
+                        }
+                    },
+                    v if v & libc::EPOLLOUT == libc::EPOLLOUT => {
+                        self.remove_interest(fd)?;
+                    }
+                    v => {
+                        if verbose {
+                            log(&format!("unexpected events: {v}"));
+                        }
+                    }
+                };
+            }
+            self.apply(interest_actions)?;
+        }
+    }
+}
+
+impl Drop for Reactor {
+    fn drop(&mut self) {
+        for (fd, _receiver) in self.receivers.drain() {
+            // TODO: do we need on_unregister() callback
+            // TODO: code duplication for syscall
+            let _ = syscall!(epoll_ctl(
+                self.epoll_fd,
+                libc::EPOLL_CTL_DEL,
+                fd,
+                std::ptr::null_mut()
+            ));
+        }
+    }
+}
+
+struct RequestListener {
+    listener: TcpListener,
+    verbose: bool,
+}
+
+impl EventReceiver for RequestListener {
+    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
+        match self.listener.accept() {
+            Ok((stream, addr)) => {
+                stream.set_nonblocking(true)?;
+                if self.verbose {
+                    log(&format!("new client: {addr}"));
+                }
+                new_actions.add(InterestAction::Add(
+                    stream.as_raw_fd(),
+                    READ_FLAGS,
+                    Rc::new(RefCell::new(RequestContext::new(stream, self.verbose))),
+                ));
+            }
+            Err(e) => {
+                if self.verbose {
+                    log(&format!("couldn't accept: {e}"));
+                }
+            }
+        };
+        new_actions.add(InterestAction::Modify(self.listener.as_raw_fd(), READ_FLAGS));
+        Ok(())
+    }
+
+    fn on_write(&mut self, _new_actions: &mut InterestActions) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn main() -> io::Result<()> {
     let mut verbose = false;
 
@@ -127,85 +345,16 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let mut request_contexts: HashMap<u64, RequestContext> = HashMap::new();
-    let mut events: Vec<libc::epoll_event> = Vec::with_capacity(1024);
-    let mut key = 100;
-
+    let mut reactor = Reactor::new();
     let listener = TcpListener::bind("127.0.0.1:8000")?;
     listener.set_nonblocking(true)?;
     let listener_fd = listener.as_raw_fd();
+    let listener = RequestListener { listener, verbose };
+    reactor.add_interest(listener_fd, READ_FLAGS, Rc::new(RefCell::new(listener)))?;
 
-    let epoll_fd = epoll_create().expect("can create epoll queue");
-    add_interest(epoll_fd, listener_fd, listener_read_event(key))?;
-
-    loop {
-        if verbose {
-            log(&format!("requests in flight: {}", request_contexts.len()));
-        }
-        events.clear();
-        let res = match syscall!(epoll_wait(
-            epoll_fd,
-            events.as_mut_ptr(),
-            1024,
-            1000 as libc::c_int,
-        )) {
-            Ok(v) => v,
-            Err(e) => panic!("error during epoll wait: {e}"),
-        };
-
-        #[allow(clippy::cast_sign_loss)]
-        unsafe {
-            events.set_len(res as usize);
-        };
-
-        for ev in &events {
-            match ev.u64 {
-                100 => {
-                    match listener.accept() {
-                        Ok((stream, addr)) => {
-                            stream.set_nonblocking(true)?;
-                            if verbose {
-                                log(&format!("new client: {addr}"));
-                            }
-                            key += 1;
-                            add_interest(epoll_fd, stream.as_raw_fd(), listener_read_event(key))?;
-                            request_contexts.insert(key, RequestContext::new(stream, verbose));
-                        }
-                        Err(e) => {
-                            if verbose {
-                                log(&format!("couldn't accept: {e}"));
-                            }
-                        }
-                    };
-                    modify_interest(epoll_fd, listener_fd, listener_read_event(100))?;
-                }
-                key => {
-                    let mut to_delete = None;
-                    if let Some(context) = request_contexts.get_mut(&key) {
-                        #[allow(clippy::cast_possible_wrap)]
-                        let events = ev.events as i32;
-                        match events {
-                            v if v & libc::EPOLLIN == libc::EPOLLIN => {
-                                context.read_cb(key, epoll_fd)?;
-                            }
-                            v if v & libc::EPOLLOUT == libc::EPOLLOUT => {
-                                context.write_cb(key, epoll_fd)?;
-                                to_delete = Some(key);
-                            }
-                            v => {
-                                if verbose {
-                                    log(&format!("unexpected events: {v}"));
-                                }
-                            }
-                        };
-                    }
-                    if let Some(key) = to_delete {
-                        request_contexts.remove(&key);
-                    }
-                }
-            }
-        }
-    }
+    //let actor_handle = actor::Handle::new(&mut reactor)?;
+    reactor.run(verbose)?;
+    Ok(())
 }
 
 fn epoll_create() -> io::Result<RawFd> {
@@ -215,38 +364,4 @@ fn epoll_create() -> io::Result<RawFd> {
     }
 
     Ok(fd)
-}
-
-fn listener_read_event(key: u64) -> libc::epoll_event {
-    libc::epoll_event {
-        events: READ_FLAGS as u32,
-        u64: key,
-    }
-}
-
-fn listener_write_event(key: u64) -> libc::epoll_event {
-    libc::epoll_event {
-        events: WRITE_FLAGS as u32,
-        u64: key,
-    }
-}
-
-fn add_interest(epoll_fd: RawFd, fd: RawFd, mut event: libc::epoll_event) -> io::Result<()> {
-    syscall!(epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event))?;
-    Ok(())
-}
-
-fn modify_interest(epoll_fd: RawFd, fd: RawFd, mut event: libc::epoll_event) -> io::Result<()> {
-    syscall!(epoll_ctl(epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut event))?;
-    Ok(())
-}
-
-fn remove_interest(epoll_fd: RawFd, fd: RawFd) -> io::Result<()> {
-    syscall!(epoll_ctl(
-        epoll_fd,
-        libc::EPOLL_CTL_DEL,
-        fd,
-        std::ptr::null_mut()
-    ))?;
-    Ok(())
 }
