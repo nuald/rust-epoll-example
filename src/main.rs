@@ -8,6 +8,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
+use std::fs::File;
+use std::os::fd::FromRawFd;
 
 pub mod actor;
 
@@ -123,7 +125,8 @@ enum InterestAction {
     Add(RawFd, i32, Rc<RefCell<dyn EventReceiver>>),
     Modify(RawFd, i32),
     Remove(RawFd),
-    Exit
+    Exit,
+    PrintStats
 }
 
 struct InterestActions {
@@ -219,6 +222,9 @@ impl Reactor {
                 InterestAction::Remove(fd) => self.remove_interest(fd)?,
                 InterestAction::Exit => {
                     exit = true;
+                },
+                InterestAction::PrintStats => {
+                    log(&format!("receivers in flight: {}", self.receivers.len()));
                 }
             }
         }
@@ -230,15 +236,12 @@ impl Reactor {
         loop {
             // TODO: avoid allocation in a loop
             let mut interest_actions = InterestActions::new();
-            if verbose {
-                log(&format!("receivers in flight: {}", self.receivers.len()));
-            }
             events.clear();
             let res = match syscall!(epoll_wait(
                 self.epoll_fd,
                 events.as_mut_ptr(),
                 1024,
-                1000 as libc::c_int,
+                -1,
             )) {
                 Ok(v) => v,
                 Err(e) => panic!("error during epoll wait: {e}"),
@@ -341,20 +344,47 @@ impl EventReceiver for RequestListener {
 }
 
 struct SignalListener {
-    signal_fd: RawFd
+    signal: File
 }
 
-impl Drop for SignalListener {
-    fn drop(&mut self) {
-        // epoll receives EPOLLHUP upon file close,
-        // so we don't need to manually drop it
-        let _ = unsafe { libc::close(self.signal_fd) };
+impl SignalListener {
+    fn new(signal_fd: RawFd) -> Self {
+        Self {
+            signal: unsafe { File::from_raw_fd(signal_fd) }
+        }
     }
 }
 
 impl EventReceiver for SignalListener {
     fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
         new_actions.add(InterestAction::Exit);
+        Ok(())
+    }
+
+    fn on_write(&mut self, _new_actions: &mut InterestActions) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct TimerListener {
+    timer: File
+}
+
+impl TimerListener {
+    fn new(timer_fd: RawFd) -> Self {
+        Self {
+            timer: unsafe { File::from_raw_fd(timer_fd) }
+        }
+    }
+}
+
+impl EventReceiver for TimerListener {
+    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
+        let mut buffer = [0; 8];
+
+        self.timer.read(&mut buffer[..])?;
+        new_actions.add(InterestAction::PrintStats);
+        new_actions.add(InterestAction::Modify(self.timer.as_raw_fd(), READ_FLAGS));
         Ok(())
     }
 
@@ -389,8 +419,23 @@ fn main() -> io::Result<()> {
     syscall!(sigaddset(&mut mask, libc::SIGINT))?;
     syscall!(sigprocmask(libc::SIG_BLOCK, &mut mask, std::ptr::null_mut()))?;
     let signal_fd = syscall!(signalfd(-1, &mask, 0))?;
-    let signal_listener = SignalListener { signal_fd };
+    let signal_listener = SignalListener::new(signal_fd);
     reactor.add_interest(signal_fd, READ_FLAGS, Rc::new(RefCell::new(signal_listener)))?;
+
+    let timer_fd = syscall!(timerfd_create(libc::CLOCK_MONOTONIC, 0))?;
+    let timer_spec = libc::itimerspec {
+        it_value: libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        },
+        it_interval: libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        },
+    };
+    syscall!(timerfd_settime(timer_fd, 0, &timer_spec, std::ptr::null_mut()))?;
+    let timer_listener = TimerListener::new(timer_fd);
+    reactor.add_interest(timer_fd, READ_FLAGS, Rc::new(RefCell::new(timer_listener)))?;
 
     //let actor_handle = actor::Handle::new(&mut reactor)?;
     reactor.run(verbose)?;
