@@ -7,6 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::collections::VecDeque;
+use std::mem::MaybeUninit;
 
 pub mod actor;
 
@@ -121,7 +122,8 @@ fn log(msg: &str) {
 enum InterestAction {
     Add(RawFd, i32, Rc<RefCell<dyn EventReceiver>>),
     Modify(RawFd, i32),
-    Remove(RawFd)
+    Remove(RawFd),
+    Exit
 }
 
 struct InterestActions {
@@ -208,15 +210,19 @@ impl Reactor {
         Ok(())
     }
 
-    fn apply(&mut self, actions: InterestActions) -> io::Result<()> {
+    fn apply(&mut self, actions: InterestActions) -> io::Result<bool> {
+        let mut exit = false;
         for action in actions {
             match action {
                 InterestAction::Add(fd, flags, receiver) => self.add_interest(fd, flags, receiver)?,
                 InterestAction::Modify(fd, flags) => self.modify_interest(fd, flags)?,
                 InterestAction::Remove(fd) => self.remove_interest(fd)?,
+                InterestAction::Exit => {
+                    exit = true;
+                }
             }
         }
-        Ok(())
+        Ok(exit)
     }
 
     fn run(&mut self, verbose: bool) -> io::Result<()> {
@@ -278,7 +284,9 @@ impl Reactor {
                     }
                 };
             }
-            self.apply(interest_actions)?;
+            if self.apply(interest_actions)? {
+                break Ok(());
+            }
         }
     }
 }
@@ -332,6 +340,29 @@ impl EventReceiver for RequestListener {
     }
 }
 
+struct SignalListener {
+    signal_fd: RawFd
+}
+
+impl Drop for SignalListener {
+    fn drop(&mut self) {
+        // epoll receives EPOLLHUP upon file close,
+        // so we don't need to manually drop it
+        let _ = unsafe { libc::close(self.signal_fd) };
+    }
+}
+
+impl EventReceiver for SignalListener {
+    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
+        new_actions.add(InterestAction::Exit);
+        Ok(())
+    }
+
+    fn on_write(&mut self, _new_actions: &mut InterestActions) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn main() -> io::Result<()> {
     let mut verbose = false;
 
@@ -352,8 +383,18 @@ fn main() -> io::Result<()> {
     let listener = RequestListener { listener, verbose };
     reactor.add_interest(listener_fd, READ_FLAGS, Rc::new(RefCell::new(listener)))?;
 
+    let mut mask = MaybeUninit::<libc::sigset_t>::uninit();
+    syscall!(sigemptyset(mask.as_mut_ptr()))?;
+    let mut mask = unsafe { mask.assume_init() };
+    syscall!(sigaddset(&mut mask, libc::SIGINT))?;
+    syscall!(sigprocmask(libc::SIG_BLOCK, &mut mask, std::ptr::null_mut()))?;
+    let signal_fd = syscall!(signalfd(-1, &mask, 0))?;
+    let signal_listener = SignalListener { signal_fd };
+    reactor.add_interest(signal_fd, READ_FLAGS, Rc::new(RefCell::new(signal_listener)))?;
+
     //let actor_handle = actor::Handle::new(&mut reactor)?;
     reactor.run(verbose)?;
+    println!("exited");
     Ok(())
 }
 
