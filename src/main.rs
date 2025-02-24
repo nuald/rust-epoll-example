@@ -1,24 +1,27 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::env;
+use std::fs::File;
 use std::io;
 use std::io::prelude::*;
-use std::net::{TcpListener, TcpStream};
+use std::mem::MaybeUninit;
+use std::net::TcpListener;
+use std::os::fd::FromRawFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
-use std::collections::VecDeque;
-use std::mem::MaybeUninit;
-use std::fs::File;
-use std::os::fd::FromRawFd;
+use std::os::fd::IntoRawFd;
 
-pub mod actor;
+pub mod content_actor;
+pub mod request_context;
+use crate::request_context::RequestContext;
 
-#[allow(unused_macros)]
 macro_rules! syscall {
     ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
         let res = unsafe { libc::$fn($($arg, )*) };
         if res == -1 {
-            Err(std::io::Error::last_os_error())
+            let err = std::io::Error::last_os_error();
+            Err(std::io::Error::new(err.kind(), format!("{}, {}:{}:{}", err, file!(), line!(), column!())))
         } else {
             Ok(res)
         }
@@ -26,95 +29,12 @@ macro_rules! syscall {
 }
 
 trait EventReceiver {
-    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()>;
-    fn on_write(&mut self, new_actions: &mut InterestActions) -> io::Result<()>;
-}
-
-#[derive(Debug)]
-pub struct RequestContext {
-    pub stream: TcpStream,
-    pub content_length: usize,
-    pub buf: Vec<u8>,
-    verbose: bool,
-}
-
-impl RequestContext {
-    fn new(stream: TcpStream, verbose: bool) -> Self {
-        Self {
-            stream,
-            buf: Vec::with_capacity(32),
-            content_length: 0,
-            verbose,
-        }
-    }
-
-    fn parse_and_set_content_length(&mut self, data: &str) {
-        let content_length_slice = "content-length: ";
-        let content_length_sz = content_length_slice.len();
-        if data.contains("HTTP") {
-            if let Some(content_length) = data.lines().find(|l| {
-                l.len() > content_length_sz
-                    && l[..content_length_sz].eq_ignore_ascii_case(content_length_slice)
-            }) {
-                self.content_length = content_length[content_length_sz..]
-                    .parse::<usize>()
-                    .expect("content-length is valid");
-                if self.verbose {
-                    log(&format!(
-                        "set content length: {} bytes",
-                        self.content_length
-                    ));
-                }
-            }
-        }
-    }
-}
-
-impl EventReceiver for RequestContext {
-    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
-        let mut buf = [0u8; 4096];
-        match self.stream.read(&mut buf) {
-            Ok(_) => {
-                if let Ok(data) = std::str::from_utf8(&buf) {
-                    self.parse_and_set_content_length(data);
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => {
-                return Err(e);
-            }
-        };
-        self.buf.extend_from_slice(&buf);
-        if self.buf.len() >= self.content_length {
-            if self.verbose {
-                log(&format!("got all data: {} bytes", self.buf.len()));
-            }
-            new_actions.add(InterestAction::Modify(self.stream.as_raw_fd(), WRITE_FLAGS));
-        } else {
-            new_actions.add(InterestAction::Modify(self.stream.as_raw_fd(), READ_FLAGS));
-        }
-        Ok(())
-    }
-
-    fn on_write(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
-        if let Err(e) = self.stream.write_all(HTTP_RESP) {
-            if self.verbose {
-                log(&format!("could not answer: {e}"));
-            }
-        }
-        new_actions.add(InterestAction::Remove(self.stream.as_raw_fd()));
-        Ok(())
-    }
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()>;
+    fn on_write(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()>;
 }
 
 const READ_FLAGS: i32 = libc::EPOLLONESHOT | libc::EPOLLIN;
 const WRITE_FLAGS: i32 = libc::EPOLLONESHOT | libc::EPOLLOUT;
-
-const HTTP_RESP: &[u8] = br"HTTP/1.1 200 OK
-content-type: text/html
-content-length: 5
-
-Hello";
 
 #[cold]
 fn log(msg: &str) {
@@ -126,7 +46,7 @@ enum InterestAction {
     Modify(RawFd, i32),
     Remove(RawFd),
     Exit,
-    PrintStats
+    PrintStats,
 }
 
 struct InterestActions {
@@ -152,7 +72,6 @@ impl Iterator for InterestActions {
         self.actions.pop_front()
     }
 }
-
 
 pub struct Reactor {
     epoll_fd: RawFd,
@@ -203,6 +122,7 @@ impl Reactor {
     }
 
     fn remove_interest(&mut self, fd: RawFd) -> io::Result<()> {
+        println!("remove Interest {fd}");
         syscall!(epoll_ctl(
             self.epoll_fd,
             libc::EPOLL_CTL_DEL,
@@ -210,6 +130,7 @@ impl Reactor {
             std::ptr::null_mut()
         ))?;
         self.receivers.remove(&fd);
+        let _ = unsafe { libc::close(fd) };
         Ok(())
     }
 
@@ -217,12 +138,14 @@ impl Reactor {
         let mut exit = false;
         for action in actions {
             match action {
-                InterestAction::Add(fd, flags, receiver) => self.add_interest(fd, flags, receiver)?,
+                InterestAction::Add(fd, flags, receiver) => {
+                    self.add_interest(fd, flags, receiver)?
+                }
                 InterestAction::Modify(fd, flags) => self.modify_interest(fd, flags)?,
                 InterestAction::Remove(fd) => self.remove_interest(fd)?,
                 InterestAction::Exit => {
                     exit = true;
-                },
+                }
                 InterestAction::PrintStats => {
                     log(&format!("receivers in flight: {}", self.receivers.len()));
                 }
@@ -237,12 +160,7 @@ impl Reactor {
             // TODO: avoid allocation in a loop
             let mut interest_actions = InterestActions::new();
             events.clear();
-            let res = match syscall!(epoll_wait(
-                self.epoll_fd,
-                events.as_mut_ptr(),
-                1024,
-                -1,
-            )) {
+            let res = match syscall!(epoll_wait(self.epoll_fd, events.as_mut_ptr(), 1024, -1,)) {
                 Ok(v) => v,
                 Err(e) => panic!("error during epoll wait: {e}"),
             };
@@ -259,7 +177,7 @@ impl Reactor {
                 match events {
                     v if v & libc::EPOLLIN == libc::EPOLLIN => match self.receivers.get(&fd) {
                         Some(receiver) => {
-                            receiver.borrow_mut().on_read(&mut interest_actions)?;
+                            receiver.borrow_mut().on_read(fd, &mut interest_actions)?;
                         }
                         None => {
                             if verbose {
@@ -269,7 +187,7 @@ impl Reactor {
                     },
                     v if v & libc::EPOLLOUT == libc::EPOLLOUT => match self.receivers.get(&fd) {
                         Some(receiver) => {
-                            receiver.borrow_mut().on_write(&mut interest_actions)?;
+                            receiver.borrow_mut().on_write(fd, &mut interest_actions)?;
                         }
                         None => {
                             if verbose {
@@ -312,10 +230,11 @@ impl Drop for Reactor {
 struct RequestListener {
     listener: TcpListener,
     verbose: bool,
+    req_actor: Rc<RefCell<RequestContext>>,
 }
 
 impl EventReceiver for RequestListener {
-    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
         match self.listener.accept() {
             Ok((stream, addr)) => {
                 stream.set_nonblocking(true)?;
@@ -323,9 +242,9 @@ impl EventReceiver for RequestListener {
                     log(&format!("new client: {addr}"));
                 }
                 new_actions.add(InterestAction::Add(
-                    stream.as_raw_fd(),
+                    stream.into_raw_fd(),
                     READ_FLAGS,
-                    Rc::new(RefCell::new(RequestContext::new(stream, self.verbose))),
+                    self.req_actor.clone(),
                 ));
             }
             Err(e) => {
@@ -334,52 +253,55 @@ impl EventReceiver for RequestListener {
                 }
             }
         };
-        new_actions.add(InterestAction::Modify(self.listener.as_raw_fd(), READ_FLAGS));
+        new_actions.add(InterestAction::Modify(
+            self.listener.as_raw_fd(),
+            READ_FLAGS,
+        ));
         Ok(())
     }
 
-    fn on_write(&mut self, _new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
         Ok(())
     }
 }
 
 struct SignalListener {
-    signal: File
+    signal: File,
 }
 
 impl SignalListener {
     fn new(signal_fd: RawFd) -> Self {
         Self {
-            signal: unsafe { File::from_raw_fd(signal_fd) }
+            signal: unsafe { File::from_raw_fd(signal_fd) },
         }
     }
 }
 
 impl EventReceiver for SignalListener {
-    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
         new_actions.add(InterestAction::Exit);
         Ok(())
     }
 
-    fn on_write(&mut self, _new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
         Ok(())
     }
 }
 
 struct TimerListener {
-    timer: File
+    timer: File,
 }
 
 impl TimerListener {
     fn new(timer_fd: RawFd) -> Self {
         Self {
-            timer: unsafe { File::from_raw_fd(timer_fd) }
+            timer: unsafe { File::from_raw_fd(timer_fd) },
         }
     }
 }
 
 impl EventReceiver for TimerListener {
-    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
         let mut buffer = [0; 8];
 
         self.timer.read(&mut buffer[..])?;
@@ -388,7 +310,7 @@ impl EventReceiver for TimerListener {
         Ok(())
     }
 
-    fn on_write(&mut self, _new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
         Ok(())
     }
 }
@@ -410,17 +332,33 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:8000")?;
     listener.set_nonblocking(true)?;
     let listener_fd = listener.as_raw_fd();
-    let listener = RequestListener { listener, verbose };
+    let content_handle = content_actor::Handle::new();
+    let req_handle = request_context::Handle::new();
+    let req_actor = req_handle.bind(&mut reactor, verbose, content_handle.clone())?;
+    content_handle.bind(&mut reactor, verbose, req_handle)?;
+    let listener = RequestListener {
+        listener,
+        verbose,
+        req_actor,
+    };
     reactor.add_interest(listener_fd, READ_FLAGS, Rc::new(RefCell::new(listener)))?;
 
     let mut mask = MaybeUninit::<libc::sigset_t>::uninit();
     syscall!(sigemptyset(mask.as_mut_ptr()))?;
     let mut mask = unsafe { mask.assume_init() };
     syscall!(sigaddset(&mut mask, libc::SIGINT))?;
-    syscall!(sigprocmask(libc::SIG_BLOCK, &mut mask, std::ptr::null_mut()))?;
+    syscall!(sigprocmask(
+        libc::SIG_BLOCK,
+        &mut mask,
+        std::ptr::null_mut()
+    ))?;
     let signal_fd = syscall!(signalfd(-1, &mask, 0))?;
     let signal_listener = SignalListener::new(signal_fd);
-    reactor.add_interest(signal_fd, READ_FLAGS, Rc::new(RefCell::new(signal_listener)))?;
+    reactor.add_interest(
+        signal_fd,
+        READ_FLAGS,
+        Rc::new(RefCell::new(signal_listener)),
+    )?;
 
     let timer_fd = syscall!(timerfd_create(libc::CLOCK_MONOTONIC, 0))?;
     let timer_spec = libc::itimerspec {
@@ -433,11 +371,15 @@ fn main() -> io::Result<()> {
             tv_nsec: 0,
         },
     };
-    syscall!(timerfd_settime(timer_fd, 0, &timer_spec, std::ptr::null_mut()))?;
+    syscall!(timerfd_settime(
+        timer_fd,
+        0,
+        &timer_spec,
+        std::ptr::null_mut()
+    ))?;
     let timer_listener = TimerListener::new(timer_fd);
     reactor.add_interest(timer_fd, READ_FLAGS, Rc::new(RefCell::new(timer_listener)))?;
 
-    //let actor_handle = actor::Handle::new(&mut reactor)?;
     reactor.run(verbose)?;
     println!("exited");
     Ok(())
