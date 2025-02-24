@@ -11,7 +11,7 @@ use std::mem::MaybeUninit;
 use std::fs::File;
 use std::os::fd::FromRawFd;
 
-pub mod actor;
+pub mod content_actor;
 
 #[allow(unused_macros)]
 macro_rules! syscall {
@@ -26,85 +26,8 @@ macro_rules! syscall {
 }
 
 trait EventReceiver {
-    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()>;
-    fn on_write(&mut self, new_actions: &mut InterestActions) -> io::Result<()>;
-}
-
-#[derive(Debug)]
-pub struct RequestContext {
-    pub stream: TcpStream,
-    pub content_length: usize,
-    pub buf: Vec<u8>,
-    verbose: bool,
-}
-
-impl RequestContext {
-    fn new(stream: TcpStream, verbose: bool) -> Self {
-        Self {
-            stream,
-            buf: Vec::with_capacity(32),
-            content_length: 0,
-            verbose,
-        }
-    }
-
-    fn parse_and_set_content_length(&mut self, data: &str) {
-        let content_length_slice = "content-length: ";
-        let content_length_sz = content_length_slice.len();
-        if data.contains("HTTP") {
-            if let Some(content_length) = data.lines().find(|l| {
-                l.len() > content_length_sz
-                    && l[..content_length_sz].eq_ignore_ascii_case(content_length_slice)
-            }) {
-                self.content_length = content_length[content_length_sz..]
-                    .parse::<usize>()
-                    .expect("content-length is valid");
-                if self.verbose {
-                    log(&format!(
-                        "set content length: {} bytes",
-                        self.content_length
-                    ));
-                }
-            }
-        }
-    }
-}
-
-impl EventReceiver for RequestContext {
-    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
-        let mut buf = [0u8; 4096];
-        match self.stream.read(&mut buf) {
-            Ok(_) => {
-                if let Ok(data) = std::str::from_utf8(&buf) {
-                    self.parse_and_set_content_length(data);
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => {
-                return Err(e);
-            }
-        };
-        self.buf.extend_from_slice(&buf);
-        if self.buf.len() >= self.content_length {
-            if self.verbose {
-                log(&format!("got all data: {} bytes", self.buf.len()));
-            }
-            new_actions.add(InterestAction::Modify(self.stream.as_raw_fd(), WRITE_FLAGS));
-        } else {
-            new_actions.add(InterestAction::Modify(self.stream.as_raw_fd(), READ_FLAGS));
-        }
-        Ok(())
-    }
-
-    fn on_write(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
-        if let Err(e) = self.stream.write_all(HTTP_RESP) {
-            if self.verbose {
-                log(&format!("could not answer: {e}"));
-            }
-        }
-        new_actions.add(InterestAction::Remove(self.stream.as_raw_fd()));
-        Ok(())
-    }
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()>;
+    fn on_write(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()>;
 }
 
 const READ_FLAGS: i32 = libc::EPOLLONESHOT | libc::EPOLLIN;
@@ -259,7 +182,7 @@ impl Reactor {
                 match events {
                     v if v & libc::EPOLLIN == libc::EPOLLIN => match self.receivers.get(&fd) {
                         Some(receiver) => {
-                            receiver.borrow_mut().on_read(&mut interest_actions)?;
+                            receiver.borrow_mut().on_read(fd, &mut interest_actions)?;
                         }
                         None => {
                             if verbose {
@@ -269,7 +192,7 @@ impl Reactor {
                     },
                     v if v & libc::EPOLLOUT == libc::EPOLLOUT => match self.receivers.get(&fd) {
                         Some(receiver) => {
-                            receiver.borrow_mut().on_write(&mut interest_actions)?;
+                            receiver.borrow_mut().on_write(fd, &mut interest_actions)?;
                         }
                         None => {
                             if verbose {
@@ -315,7 +238,7 @@ struct RequestListener {
 }
 
 impl EventReceiver for RequestListener {
-    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
         match self.listener.accept() {
             Ok((stream, addr)) => {
                 stream.set_nonblocking(true)?;
@@ -338,7 +261,7 @@ impl EventReceiver for RequestListener {
         Ok(())
     }
 
-    fn on_write(&mut self, _new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
         Ok(())
     }
 }
@@ -437,7 +360,7 @@ fn main() -> io::Result<()> {
     let timer_listener = TimerListener::new(timer_fd);
     reactor.add_interest(timer_fd, READ_FLAGS, Rc::new(RefCell::new(timer_listener)))?;
 
-    //let actor_handle = actor::Handle::new(&mut reactor)?;
+    let content_actor_handle = content_actor::Handle::new(&mut reactor)?;
     reactor.run(verbose)?;
     println!("exited");
     Ok(())

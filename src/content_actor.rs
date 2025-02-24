@@ -35,14 +35,14 @@ impl Actor {
 }
 
 impl EventReceiver for Actor {
-    fn on_read(&mut self, _new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_read(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
         for msg in self.ctr_queue.borrow_mut().drain(..) {
             self.handle_message(msg);
         }
         Ok(())
     }
 
-    fn on_write(&mut self, _new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
         Ok(())
     }
 }
