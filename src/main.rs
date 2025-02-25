@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::io::prelude::*;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::collections::VecDeque;
@@ -12,6 +12,7 @@ use std::fs::File;
 use std::os::fd::FromRawFd;
 
 pub mod content_actor;
+pub mod request_context;
 
 #[allow(unused_macros)]
 macro_rules! syscall {
@@ -32,12 +33,6 @@ trait EventReceiver {
 
 const READ_FLAGS: i32 = libc::EPOLLONESHOT | libc::EPOLLIN;
 const WRITE_FLAGS: i32 = libc::EPOLLONESHOT | libc::EPOLLOUT;
-
-const HTTP_RESP: &[u8] = br"HTTP/1.1 200 OK
-content-type: text/html
-content-length: 5
-
-Hello";
 
 #[cold]
 fn log(msg: &str) {
@@ -235,6 +230,7 @@ impl Drop for Reactor {
 struct RequestListener {
     listener: TcpListener,
     verbose: bool,
+    req_handle: request_context::Handle,
 }
 
 impl EventReceiver for RequestListener {
@@ -248,7 +244,7 @@ impl EventReceiver for RequestListener {
                 new_actions.add(InterestAction::Add(
                     stream.as_raw_fd(),
                     READ_FLAGS,
-                    Rc::new(RefCell::new(RequestContext::new(stream, self.verbose))),
+                    self.req_handle.get_receiver(),
                 ));
             }
             Err(e) => {
@@ -279,12 +275,12 @@ impl SignalListener {
 }
 
 impl EventReceiver for SignalListener {
-    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
         new_actions.add(InterestAction::Exit);
         Ok(())
     }
 
-    fn on_write(&mut self, _new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
         Ok(())
     }
 }
@@ -302,7 +298,7 @@ impl TimerListener {
 }
 
 impl EventReceiver for TimerListener {
-    fn on_read(&mut self, new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
         let mut buffer = [0; 8];
 
         self.timer.read(&mut buffer[..])?;
@@ -311,7 +307,7 @@ impl EventReceiver for TimerListener {
         Ok(())
     }
 
-    fn on_write(&mut self, _new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
         Ok(())
     }
 }
@@ -333,7 +329,8 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:8000")?;
     listener.set_nonblocking(true)?;
     let listener_fd = listener.as_raw_fd();
-    let listener = RequestListener { listener, verbose };
+    let req_handle = request_context::Handle::new(&mut reactor, verbose)?;
+    let listener = RequestListener { listener, verbose, req_handle: req_handle.clone() };
     reactor.add_interest(listener_fd, READ_FLAGS, Rc::new(RefCell::new(listener)))?;
 
     let mut mask = MaybeUninit::<libc::sigset_t>::uninit();
@@ -360,7 +357,7 @@ fn main() -> io::Result<()> {
     let timer_listener = TimerListener::new(timer_fd);
     reactor.add_interest(timer_fd, READ_FLAGS, Rc::new(RefCell::new(timer_listener)))?;
 
-    let content_actor_handle = content_actor::Handle::new(&mut reactor)?;
+    let content_actor_handle = content_actor::Handle::new(&mut reactor, verbose)?;
     reactor.run(verbose)?;
     println!("exited");
     Ok(())
