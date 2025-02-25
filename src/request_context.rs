@@ -1,19 +1,20 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::io;
 use std::os::fd::RawFd;
 use std::os::raw::c_void;
-use std::io;
 use std::rc::Rc;
-use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::collections::HashMap;
 
-use crate::Reactor;
+use crate::content_actor::Handle as ContentHandle;
+use crate::content_actor::Message as ContentMessage;
 use crate::log;
-use crate::content_actor::Message as ContentActorMessage;
+use crate::EventReceiver;
 use crate::InterestAction;
 use crate::InterestActions;
-use crate::WRITE_FLAGS;
+use crate::Reactor;
 use crate::READ_FLAGS;
-use crate::EventReceiver;
+use crate::WRITE_FLAGS;
 
 const HTTP_RESP: &[u8] = br"HTTP/1.1 200 OK
 content-type: text/html
@@ -26,6 +27,7 @@ pub struct RequestContext {
     verbose: bool,
     efd: RawFd,
     ctr_queue: Rc<RefCell<VecDeque<Message>>>,
+    content_handle: ContentHandle,
 }
 
 pub enum Message {
@@ -36,36 +38,43 @@ pub enum Message {
 }
 
 impl RequestContext {
-    fn new(ctr_queue: Rc<RefCell<VecDeque<Message>>>, efd: RawFd, verbose: bool) -> Self {
+    fn new(
+        ctr_queue: Rc<RefCell<VecDeque<Message>>>,
+        efd: RawFd,
+        verbose: bool,
+        content_handle: ContentHandle,
+    ) -> Self {
         Self {
             buf: HashMap::new(),
             verbose,
             ctr_queue,
             efd,
+            content_handle,
         }
     }
 
     fn handle_message(&self, msg: Message, new_actions: &mut InterestActions) {
         match msg {
-            Message::ContentLengthResponse{receiver, content_length} => {
-                match self.buf.get(&receiver) {
-                    Some(buf) => {
-                        if buf.len() >= content_length {
-                            if self.verbose {
-                                log(&format!("got all data: {} bytes", buf.len()));
-                            }
-                            new_actions.add(InterestAction::Modify(receiver, WRITE_FLAGS));
-                        } else {
-                            new_actions.add(InterestAction::Modify(receiver, READ_FLAGS));
-                        }
-                    }
-                    None => {
+            Message::ContentLengthResponse {
+                receiver,
+                content_length,
+            } => match self.buf.get(&receiver) {
+                Some(buf) => {
+                    if buf.len() >= content_length {
                         if self.verbose {
-                            log(&format!("unexpected fd {receiver}"));
+                            log(&format!("got all data: {} bytes", buf.len()));
                         }
+                        new_actions.add(InterestAction::Modify(receiver, WRITE_FLAGS));
+                    } else {
+                        new_actions.add(InterestAction::Modify(receiver, READ_FLAGS));
                     }
                 }
-            }
+                None => {
+                    if self.verbose {
+                        log(&format!("unexpected fd {receiver}"));
+                    }
+                }
+            },
         }
     }
 }
@@ -84,13 +93,17 @@ impl EventReceiver for RequestContext {
             if res > 0 {
                 let sz = res as usize;
                 let data = String::from_utf8_lossy(&buf[..sz]).into_owned();
-                content_handle.enqueue(ContentActorMessage::ContentLengthRequest{
-                    req: data,
-                    sender: fd,
-                });
-                self.buf.entry(fd).or_insert_with(|| Vec::with_capacity(32)).extend_from_slice(&buf[..sz]);
+                self.content_handle
+                    .enqueue(ContentMessage::ContentLengthRequest {
+                        req: data,
+                        sender: fd,
+                    });
+                self.buf
+                    .entry(fd)
+                    .or_insert_with(|| Vec::with_capacity(32))
+                    .extend_from_slice(&buf[..sz]);
             } else if res != libc::EWOULDBLOCK as _ {
-                return Err(std::io::Error::last_os_error())
+                return Err(std::io::Error::last_os_error());
             }
         }
         Ok(())
@@ -117,18 +130,15 @@ impl EventReceiver for RequestContext {
 pub struct Handle {
     efd: RawFd,
     ctr_queue: Rc<RefCell<VecDeque<Message>>>,
-    actor: Rc<RefCell<RequestContext>>,
 }
 
 impl Handle {
     #[must_use]
-    pub fn new(reactor: &mut Reactor, verbose: bool) -> io::Result<Self> {
+    pub fn new() -> Self {
         let ctr_queue = Rc::new(RefCell::new(VecDeque::new()));
         let efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_NONBLOCK) };
-        let actor = Rc::new(RefCell::new(RequestContext::new(ctr_queue.clone(), efd, verbose)));
-        reactor.add_interest(efd, READ_FLAGS, actor.clone())?;
 
-        Ok(Self { efd, ctr_queue, actor })
+        Self { efd, ctr_queue }
     }
 
     pub fn enqueue(&self, msg: Message) {
@@ -136,8 +146,20 @@ impl Handle {
         unsafe { libc::eventfd_write(self.efd, 1) };
     }
 
-    pub fn get_receiver(&self) -> Rc<RefCell<dyn EventReceiver>> {
-        self.actor.clone()
+    pub fn bind(
+        &self,
+        reactor: &mut Reactor,
+        verbose: bool,
+        content_handle: ContentHandle,
+    ) -> io::Result<Rc<RefCell<RequestContext>>> {
+        let actor = Rc::new(RefCell::new(RequestContext::new(
+            self.ctr_queue.clone(),
+            self.efd,
+            verbose,
+            content_handle,
+        )));
+        reactor.add_interest(self.efd, READ_FLAGS, actor.clone())?;
+        Ok(actor)
     }
 }
 

@@ -1,20 +1,20 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::env;
+use std::fs::File;
 use std::io;
 use std::io::prelude::*;
+use std::mem::MaybeUninit;
 use std::net::TcpListener;
+use std::os::fd::FromRawFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
-use std::collections::VecDeque;
-use std::mem::MaybeUninit;
-use std::fs::File;
-use std::os::fd::FromRawFd;
 
 pub mod content_actor;
 pub mod request_context;
+use crate::request_context::RequestContext;
 
-#[allow(unused_macros)]
 macro_rules! syscall {
     ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
         let res = unsafe { libc::$fn($($arg, )*) };
@@ -44,7 +44,7 @@ enum InterestAction {
     Modify(RawFd, i32),
     Remove(RawFd),
     Exit,
-    PrintStats
+    PrintStats,
 }
 
 struct InterestActions {
@@ -70,7 +70,6 @@ impl Iterator for InterestActions {
         self.actions.pop_front()
     }
 }
-
 
 pub struct Reactor {
     epoll_fd: RawFd,
@@ -135,12 +134,14 @@ impl Reactor {
         let mut exit = false;
         for action in actions {
             match action {
-                InterestAction::Add(fd, flags, receiver) => self.add_interest(fd, flags, receiver)?,
+                InterestAction::Add(fd, flags, receiver) => {
+                    self.add_interest(fd, flags, receiver)?
+                }
                 InterestAction::Modify(fd, flags) => self.modify_interest(fd, flags)?,
                 InterestAction::Remove(fd) => self.remove_interest(fd)?,
                 InterestAction::Exit => {
                     exit = true;
-                },
+                }
                 InterestAction::PrintStats => {
                     log(&format!("receivers in flight: {}", self.receivers.len()));
                 }
@@ -155,12 +156,7 @@ impl Reactor {
             // TODO: avoid allocation in a loop
             let mut interest_actions = InterestActions::new();
             events.clear();
-            let res = match syscall!(epoll_wait(
-                self.epoll_fd,
-                events.as_mut_ptr(),
-                1024,
-                -1,
-            )) {
+            let res = match syscall!(epoll_wait(self.epoll_fd, events.as_mut_ptr(), 1024, -1,)) {
                 Ok(v) => v,
                 Err(e) => panic!("error during epoll wait: {e}"),
             };
@@ -230,7 +226,7 @@ impl Drop for Reactor {
 struct RequestListener {
     listener: TcpListener,
     verbose: bool,
-    req_handle: request_context::Handle,
+    req_actor: Rc<RefCell<RequestContext>>,
 }
 
 impl EventReceiver for RequestListener {
@@ -244,7 +240,7 @@ impl EventReceiver for RequestListener {
                 new_actions.add(InterestAction::Add(
                     stream.as_raw_fd(),
                     READ_FLAGS,
-                    self.req_handle.get_receiver(),
+                    self.req_actor.clone(),
                 ));
             }
             Err(e) => {
@@ -253,7 +249,10 @@ impl EventReceiver for RequestListener {
                 }
             }
         };
-        new_actions.add(InterestAction::Modify(self.listener.as_raw_fd(), READ_FLAGS));
+        new_actions.add(InterestAction::Modify(
+            self.listener.as_raw_fd(),
+            READ_FLAGS,
+        ));
         Ok(())
     }
 
@@ -263,13 +262,13 @@ impl EventReceiver for RequestListener {
 }
 
 struct SignalListener {
-    signal: File
+    signal: File,
 }
 
 impl SignalListener {
     fn new(signal_fd: RawFd) -> Self {
         Self {
-            signal: unsafe { File::from_raw_fd(signal_fd) }
+            signal: unsafe { File::from_raw_fd(signal_fd) },
         }
     }
 }
@@ -286,13 +285,13 @@ impl EventReceiver for SignalListener {
 }
 
 struct TimerListener {
-    timer: File
+    timer: File,
 }
 
 impl TimerListener {
     fn new(timer_fd: RawFd) -> Self {
         Self {
-            timer: unsafe { File::from_raw_fd(timer_fd) }
+            timer: unsafe { File::from_raw_fd(timer_fd) },
         }
     }
 }
@@ -329,18 +328,33 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:8000")?;
     listener.set_nonblocking(true)?;
     let listener_fd = listener.as_raw_fd();
-    let req_handle = request_context::Handle::new(&mut reactor, verbose)?;
-    let listener = RequestListener { listener, verbose, req_handle: req_handle.clone() };
+    let content_handle = content_actor::Handle::new();
+    let req_handle = request_context::Handle::new();
+    let req_actor = req_handle.bind(&mut reactor, verbose, content_handle.clone())?;
+    content_handle.bind(&mut reactor, verbose, req_handle)?;
+    let listener = RequestListener {
+        listener,
+        verbose,
+        req_actor,
+    };
     reactor.add_interest(listener_fd, READ_FLAGS, Rc::new(RefCell::new(listener)))?;
 
     let mut mask = MaybeUninit::<libc::sigset_t>::uninit();
     syscall!(sigemptyset(mask.as_mut_ptr()))?;
     let mut mask = unsafe { mask.assume_init() };
     syscall!(sigaddset(&mut mask, libc::SIGINT))?;
-    syscall!(sigprocmask(libc::SIG_BLOCK, &mut mask, std::ptr::null_mut()))?;
+    syscall!(sigprocmask(
+        libc::SIG_BLOCK,
+        &mut mask,
+        std::ptr::null_mut()
+    ))?;
     let signal_fd = syscall!(signalfd(-1, &mask, 0))?;
     let signal_listener = SignalListener::new(signal_fd);
-    reactor.add_interest(signal_fd, READ_FLAGS, Rc::new(RefCell::new(signal_listener)))?;
+    reactor.add_interest(
+        signal_fd,
+        READ_FLAGS,
+        Rc::new(RefCell::new(signal_listener)),
+    )?;
 
     let timer_fd = syscall!(timerfd_create(libc::CLOCK_MONOTONIC, 0))?;
     let timer_spec = libc::itimerspec {
@@ -353,11 +367,15 @@ fn main() -> io::Result<()> {
             tv_nsec: 0,
         },
     };
-    syscall!(timerfd_settime(timer_fd, 0, &timer_spec, std::ptr::null_mut()))?;
+    syscall!(timerfd_settime(
+        timer_fd,
+        0,
+        &timer_spec,
+        std::ptr::null_mut()
+    ))?;
     let timer_listener = TimerListener::new(timer_fd);
     reactor.add_interest(timer_fd, READ_FLAGS, Rc::new(RefCell::new(timer_listener)))?;
 
-    let content_actor_handle = content_actor::Handle::new(&mut reactor, verbose)?;
     reactor.run(verbose)?;
     println!("exited");
     Ok(())

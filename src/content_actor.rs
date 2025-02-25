@@ -6,27 +6,34 @@ use std::rc::Rc;
 
 use crate::log;
 use crate::EventReceiver;
+use crate::InterestActions;
 use crate::Reactor;
 use crate::READ_FLAGS;
-use crate::InterestActions;
 
-use crate::request_context::Message as RequestContextMessage;
+use crate::request_context::Handle as ReqHandle;
+use crate::request_context::Message as ReqMessage;
 
 pub enum Message {
-    ContentLengthRequest {
-        req: String,
-        sender: RawFd,
-    },
+    ContentLengthRequest { req: String, sender: RawFd },
 }
 
 struct Actor {
     verbose: bool,
     ctr_queue: Rc<RefCell<VecDeque<Message>>>,
+    req_handle: ReqHandle,
 }
 
 impl Actor {
-    fn new(ctr_queue: Rc<RefCell<VecDeque<Message>>>, verbose: bool) -> Self {
-        Self { ctr_queue, verbose, }
+    fn new(
+        ctr_queue: Rc<RefCell<VecDeque<Message>>>,
+        verbose: bool,
+        req_handle: ReqHandle,
+    ) -> Self {
+        Self {
+            ctr_queue,
+            verbose,
+            req_handle,
+        }
     }
 
     fn parse_and_set_content_length(&self, data: &str) -> usize {
@@ -42,10 +49,7 @@ impl Actor {
                     .parse::<usize>()
                     .expect("content-length is valid");
                 if self.verbose {
-                    log(&format!(
-                        "set content length: {} bytes",
-                        result
-                    ));
+                    log(&format!("set content length: {} bytes", result));
                 }
             }
         }
@@ -54,9 +58,9 @@ impl Actor {
 
     fn handle_message(&self, msg: Message) {
         match msg {
-            Message::ContentLengthRequest{req, sender} => {
+            Message::ContentLengthRequest { req, sender } => {
                 let content_length = self.parse_and_set_content_length(&req);
-                req_handle.enqueue(RequestContextMessage::ContentLengthResponse{
+                self.req_handle.enqueue(ReqMessage::ContentLengthResponse {
                     receiver: sender,
                     content_length,
                 });
@@ -86,18 +90,27 @@ pub struct Handle {
 
 impl Handle {
     #[must_use]
-    pub fn new(reactor: &mut Reactor, verbose: bool) -> io::Result<Self> {
+    pub fn new() -> Self {
         let ctr_queue = Rc::new(RefCell::new(VecDeque::new()));
-        let actor = Actor::new(ctr_queue.clone(), verbose);
         let efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_NONBLOCK) };
-        reactor.add_interest(efd, READ_FLAGS, Rc::new(RefCell::new(actor)))?;
 
-        Ok(Self { efd, ctr_queue })
+        Self { efd, ctr_queue }
     }
 
     pub fn enqueue(&self, msg: Message) {
         self.ctr_queue.borrow_mut().push_back(msg);
         unsafe { libc::eventfd_write(self.efd, 1) };
+    }
+
+    pub fn bind(
+        &self,
+        reactor: &mut Reactor,
+        verbose: bool,
+        req_handle: ReqHandle,
+    ) -> io::Result<()> {
+        let actor = Actor::new(self.ctr_queue.clone(), verbose, req_handle);
+        reactor.add_interest(self.efd, READ_FLAGS, Rc::new(RefCell::new(actor)))?;
+        Ok(())
     }
 }
 
