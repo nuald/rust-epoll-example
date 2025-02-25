@@ -3,12 +3,14 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::fd::RawFd;
 use std::rc::Rc;
+use std::mem::MaybeUninit;
 
 use crate::log;
 use crate::EventReceiver;
 use crate::InterestActions;
 use crate::Reactor;
 use crate::READ_FLAGS;
+use crate::InterestAction;
 
 use crate::request_context::Handle as ReqHandle;
 use crate::request_context::Message as ReqMessage;
@@ -70,10 +72,13 @@ impl Actor {
 }
 
 impl EventReceiver for Actor {
-    fn on_read(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
+        let mut value = MaybeUninit::<u64>::uninit();
+        let _  = unsafe { libc::eventfd_read(fd, value.as_mut_ptr()) };
         for msg in self.ctr_queue.borrow_mut().drain(..) {
             self.handle_message(msg);
         }
+        new_actions.add(InterestAction::Modify(fd, READ_FLAGS));
         Ok(())
     }
 

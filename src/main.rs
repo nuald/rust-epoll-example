@@ -10,6 +10,7 @@ use std::net::TcpListener;
 use std::os::fd::FromRawFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
+use std::os::fd::IntoRawFd;
 
 pub mod content_actor;
 pub mod request_context;
@@ -19,7 +20,8 @@ macro_rules! syscall {
     ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
         let res = unsafe { libc::$fn($($arg, )*) };
         if res == -1 {
-            Err(std::io::Error::last_os_error())
+            let err = std::io::Error::last_os_error();
+            Err(std::io::Error::new(err.kind(), format!("{}, {}:{}:{}", err, file!(), line!(), column!())))
         } else {
             Ok(res)
         }
@@ -238,7 +240,7 @@ impl EventReceiver for RequestListener {
                     log(&format!("new client: {addr}"));
                 }
                 new_actions.add(InterestAction::Add(
-                    stream.as_raw_fd(),
+                    stream.into_raw_fd(),
                     READ_FLAGS,
                     self.req_actor.clone(),
                 ));

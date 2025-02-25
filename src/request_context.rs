@@ -5,6 +5,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::os::raw::c_void;
 use std::rc::Rc;
+use std::mem::MaybeUninit;
 
 use crate::content_actor::Handle as ContentHandle;
 use crate::content_actor::Message as ContentMessage;
@@ -28,6 +29,7 @@ pub struct RequestContext {
     efd: RawFd,
     ctr_queue: Rc<RefCell<VecDeque<Message>>>,
     content_handle: ContentHandle,
+    content_length: RefCell<HashMap<RawFd, usize>>,
 }
 
 pub enum Message {
@@ -50,6 +52,7 @@ impl RequestContext {
             ctr_queue,
             efd,
             content_handle,
+            content_length: RefCell::new(HashMap::new()),
         }
     }
 
@@ -58,23 +61,30 @@ impl RequestContext {
             Message::ContentLengthResponse {
                 receiver,
                 content_length,
-            } => match self.buf.get(&receiver) {
-                Some(buf) => {
-                    if buf.len() >= content_length {
-                        if self.verbose {
-                            log(&format!("got all data: {} bytes", buf.len()));
-                        }
-                        new_actions.add(InterestAction::Modify(receiver, WRITE_FLAGS));
-                    } else {
-                        new_actions.add(InterestAction::Modify(receiver, READ_FLAGS));
-                    }
-                }
-                None => {
+            } => {
+                self.content_length.borrow_mut().insert(receiver, content_length);
+                self.check_length(receiver, content_length, new_actions);
+            }
+        }
+    }
+
+    fn check_length(&self, fd: RawFd, length: usize, new_actions: &mut InterestActions) {
+        match self.buf.get(&fd) {
+            Some(buf) => {
+                if buf.len() >= length {
                     if self.verbose {
-                        log(&format!("unexpected fd {receiver}"));
+                        log(&format!("got all data: {} bytes", buf.len()));
                     }
+                    new_actions.add(InterestAction::Modify(fd, WRITE_FLAGS));
+                } else {
+                    new_actions.add(InterestAction::Modify(fd, READ_FLAGS));
                 }
-            },
+            }
+            None => {
+                if self.verbose {
+                    log(&format!("unexpected fd {fd}"));
+                }
+            }
         }
     }
 }
@@ -83,25 +93,35 @@ impl EventReceiver for RequestContext {
     fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
         if fd == self.efd {
             // Control message
+            let mut value = MaybeUninit::<u64>::uninit();
+            let _  = unsafe { libc::eventfd_read(fd, value.as_mut_ptr()) };
             for msg in self.ctr_queue.borrow_mut().drain(..) {
                 self.handle_message(msg, new_actions);
             }
+            new_actions.add(InterestAction::Modify(fd, READ_FLAGS));
         } else {
             // TCP request
             let mut buf = [0u8; 4096];
             let res = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
             if res > 0 {
                 let sz = res as usize;
-                let data = String::from_utf8_lossy(&buf[..sz]).into_owned();
-                self.content_handle
-                    .enqueue(ContentMessage::ContentLengthRequest {
-                        req: data,
-                        sender: fd,
-                    });
                 self.buf
                     .entry(fd)
                     .or_insert_with(|| Vec::with_capacity(32))
                     .extend_from_slice(&buf[..sz]);
+                match self.content_length.borrow().get(&fd) {
+                    None => {
+                        let data = String::from_utf8_lossy(&buf[..sz]).into_owned();
+                        self.content_handle
+                            .enqueue(ContentMessage::ContentLengthRequest {
+                                req: data,
+                                sender: fd,
+                            });
+                    },
+                    Some(length) => {
+                        self.check_length(fd, *length, new_actions);
+                    }
+                }
             } else if res != libc::EWOULDBLOCK as _ {
                 return Err(std::io::Error::last_os_error());
             }
