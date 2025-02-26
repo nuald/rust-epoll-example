@@ -1,21 +1,17 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::env;
-use std::fs::File;
-use std::io;
-use std::io::prelude::*;
-use std::mem::MaybeUninit;
+use std::collections::{HashMap, VecDeque};
 use std::net::TcpListener;
-use std::os::fd::FromRawFd;
+use std::os::fd::IntoRawFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
-use std::os::fd::IntoRawFd;
 
 pub mod content_actor;
 pub mod request_context;
+pub mod signal;
+pub mod timer;
 use crate::request_context::RequestContext;
 
+#[macro_export]
 macro_rules! syscall {
     ($fn: ident ( $($arg: expr),* $(,)* ) ) => {{
         let res = unsafe { libc::$fn($($arg, )*) };
@@ -29,8 +25,8 @@ macro_rules! syscall {
 }
 
 trait EventReceiver {
-    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()>;
-    fn on_write(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()>;
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()>;
+    fn on_write(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()>;
 }
 
 const READ_FLAGS: i32 = libc::EPOLLONESHOT | libc::EPOLLIN;
@@ -92,7 +88,7 @@ impl Reactor {
         fd: RawFd,
         flags: i32,
         receiver: Rc<RefCell<dyn EventReceiver>>,
-    ) -> io::Result<()> {
+    ) -> std::io::Result<()> {
         let mut event = libc::epoll_event {
             events: flags as u32,
             u64: fd as u64,
@@ -107,7 +103,7 @@ impl Reactor {
         Ok(())
     }
 
-    fn modify_interest(&self, fd: RawFd, flags: i32) -> io::Result<()> {
+    fn modify_interest(&self, fd: RawFd, flags: i32) -> std::io::Result<()> {
         let mut event = libc::epoll_event {
             events: flags as u32,
             u64: fd as u64,
@@ -121,7 +117,7 @@ impl Reactor {
         Ok(())
     }
 
-    fn remove_interest(&mut self, fd: RawFd) -> io::Result<()> {
+    fn remove_interest(&mut self, fd: RawFd) -> std::io::Result<()> {
         println!("remove Interest {fd}");
         syscall!(epoll_ctl(
             self.epoll_fd,
@@ -134,12 +130,12 @@ impl Reactor {
         Ok(())
     }
 
-    fn apply(&mut self, actions: InterestActions) -> io::Result<bool> {
+    fn apply(&mut self, actions: InterestActions) -> std::io::Result<bool> {
         let mut exit = false;
         for action in actions {
             match action {
                 InterestAction::Add(fd, flags, receiver) => {
-                    self.add_interest(fd, flags, receiver)?
+                    self.add_interest(fd, flags, receiver)?;
                 }
                 InterestAction::Modify(fd, flags) => self.modify_interest(fd, flags)?,
                 InterestAction::Remove(fd) => self.remove_interest(fd)?,
@@ -154,7 +150,7 @@ impl Reactor {
         Ok(exit)
     }
 
-    fn run(&mut self, verbose: bool) -> io::Result<()> {
+    fn run(&mut self, verbose: bool) -> std::io::Result<()> {
         let mut events: Vec<libc::epoll_event> = Vec::with_capacity(1024);
         loop {
             // TODO: avoid allocation in a loop
@@ -234,7 +230,7 @@ struct RequestListener {
 }
 
 impl EventReceiver for RequestListener {
-    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
         match self.listener.accept() {
             Ok((stream, addr)) => {
                 stream.set_nonblocking(true)?;
@@ -260,65 +256,15 @@ impl EventReceiver for RequestListener {
         Ok(())
     }
 
-    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> std::io::Result<()> {
         Ok(())
     }
 }
 
-struct SignalListener {
-    signal: File,
-}
-
-impl SignalListener {
-    fn new(signal_fd: RawFd) -> Self {
-        Self {
-            signal: unsafe { File::from_raw_fd(signal_fd) },
-        }
-    }
-}
-
-impl EventReceiver for SignalListener {
-    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
-        new_actions.add(InterestAction::Exit);
-        Ok(())
-    }
-
-    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-struct TimerListener {
-    timer: File,
-}
-
-impl TimerListener {
-    fn new(timer_fd: RawFd) -> Self {
-        Self {
-            timer: unsafe { File::from_raw_fd(timer_fd) },
-        }
-    }
-}
-
-impl EventReceiver for TimerListener {
-    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
-        let mut buffer = [0; 8];
-
-        self.timer.read(&mut buffer[..])?;
-        new_actions.add(InterestAction::PrintStats);
-        new_actions.add(InterestAction::Modify(self.timer.as_raw_fd(), READ_FLAGS));
-        Ok(())
-    }
-
-    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn main() -> io::Result<()> {
+fn main() -> std::io::Result<()> {
     let mut verbose = false;
 
-    let args = env::args().skip(1);
+    let args = std::env::args().skip(1);
     for arg in args {
         match &arg[..] {
             "-v" | "--verbose" => {
@@ -332,8 +278,8 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:8000")?;
     listener.set_nonblocking(true)?;
     let listener_fd = listener.as_raw_fd();
-    let content_handle = content_actor::Handle::new();
-    let req_handle = request_context::Handle::new();
+    let content_handle = content_actor::Handle::new()?;
+    let req_handle = request_context::Handle::new()?;
     let req_actor = req_handle.bind(&mut reactor, verbose, content_handle.clone())?;
     content_handle.bind(&mut reactor, verbose, req_handle)?;
     let listener = RequestListener {
@@ -343,49 +289,22 @@ fn main() -> io::Result<()> {
     };
     reactor.add_interest(listener_fd, READ_FLAGS, Rc::new(RefCell::new(listener)))?;
 
-    let mut mask = MaybeUninit::<libc::sigset_t>::uninit();
-    syscall!(sigemptyset(mask.as_mut_ptr()))?;
-    let mut mask = unsafe { mask.assume_init() };
-    syscall!(sigaddset(&mut mask, libc::SIGINT))?;
-    syscall!(sigprocmask(
-        libc::SIG_BLOCK,
-        &mut mask,
-        std::ptr::null_mut()
-    ))?;
-    let signal_fd = syscall!(signalfd(-1, &mask, 0))?;
-    let signal_listener = SignalListener::new(signal_fd);
+    let signal_listener = signal::Listener::new()?;
     reactor.add_interest(
-        signal_fd,
+        signal_listener.fd,
         READ_FLAGS,
         Rc::new(RefCell::new(signal_listener)),
     )?;
 
-    let timer_fd = syscall!(timerfd_create(libc::CLOCK_MONOTONIC, 0))?;
-    let timer_spec = libc::itimerspec {
-        it_value: libc::timespec {
-            tv_sec: 1,
-            tv_nsec: 0,
-        },
-        it_interval: libc::timespec {
-            tv_sec: 1,
-            tv_nsec: 0,
-        },
-    };
-    syscall!(timerfd_settime(
-        timer_fd,
-        0,
-        &timer_spec,
-        std::ptr::null_mut()
-    ))?;
-    let timer_listener = TimerListener::new(timer_fd);
-    reactor.add_interest(timer_fd, READ_FLAGS, Rc::new(RefCell::new(timer_listener)))?;
+    let timer_listener = timer::Listener::new()?;
+    reactor.add_interest(timer_listener.fd, READ_FLAGS, Rc::new(RefCell::new(timer_listener)))?;
 
     reactor.run(verbose)?;
     println!("exited");
     Ok(())
 }
 
-fn epoll_create() -> io::Result<RawFd> {
+fn epoll_create() -> std::io::Result<RawFd> {
     let fd = syscall!(epoll_create1(0))?;
     if let Ok(flags) = syscall!(fcntl(fd, libc::F_GETFD)) {
         let _ = syscall!(fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC));

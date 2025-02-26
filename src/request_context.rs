@@ -1,15 +1,13 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::io;
+use std::collections::{HashMap, VecDeque};
+use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
 use std::os::raw::c_void;
 use std::rc::Rc;
-use std::mem::MaybeUninit;
 
 use crate::content_actor::Handle as ContentHandle;
 use crate::content_actor::Message as ContentMessage;
-use crate::log;
+use crate::{log, syscall};
 use crate::EventReceiver;
 use crate::InterestAction;
 use crate::InterestActions;
@@ -62,7 +60,9 @@ impl RequestContext {
                 receiver,
                 content_length,
             } => {
-                self.content_length.borrow_mut().insert(*receiver, *content_length);
+                self.content_length
+                    .borrow_mut()
+                    .insert(*receiver, *content_length);
                 self.check_length(*receiver, *content_length, new_actions);
             }
         }
@@ -90,11 +90,11 @@ impl RequestContext {
 }
 
 impl EventReceiver for RequestContext {
-    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
         if fd == self.efd {
             // Control message
             let mut value = MaybeUninit::<u64>::uninit();
-            let _  = unsafe { libc::eventfd_read(fd, value.as_mut_ptr()) };
+            syscall!(eventfd_read(fd, value.as_mut_ptr()))?;
             for msg in self.ctr_queue.borrow_mut().drain(..) {
                 self.handle_message(&msg, new_actions);
             }
@@ -121,17 +121,17 @@ impl EventReceiver for RequestContext {
                         .enqueue(ContentMessage::ContentLengthRequest {
                             req: data,
                             sender: fd,
-                        });
-                },
+                        })?;
+                }
                 Some(length) => {
                     self.check_length(fd, *length, new_actions);
-                }          
+                }
             }
         }
         Ok(())
     }
 
-    fn on_write(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> io::Result<()> {
+    fn on_write(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
         let res = unsafe { libc::write(fd, HTTP_RESP.as_ptr().cast::<c_void>(), HTTP_RESP.len()) };
         if res > 0 {
             if self.verbose {
@@ -143,7 +143,7 @@ impl EventReceiver for RequestContext {
                 log(&format!("could not answer to fd {fd}: {e}"));
             }
         }
-        let _ = unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+        syscall!(shutdown(fd, libc::SHUT_RDWR))?;
         new_actions.add(InterestAction::Remove(fd));
         Ok(())
     }
@@ -156,25 +156,25 @@ pub struct Handle {
 }
 
 impl Handle {
-    #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> std::io::Result<Self> {
         let ctr_queue = Rc::new(RefCell::new(VecDeque::new()));
-        let efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_NONBLOCK) };
+        let efd = syscall!(eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_NONBLOCK))?;
 
-        Self { efd, ctr_queue }
+        Ok(Self { efd, ctr_queue })
     }
 
-    pub fn enqueue(&self, msg: Message) {
+    pub(crate) fn enqueue(&self, msg: Message) -> std::io::Result<()> {
         self.ctr_queue.borrow_mut().push_back(msg);
-        unsafe { libc::eventfd_write(self.efd, 1) };
+        syscall!(eventfd_write(self.efd, 1))?;
+        Ok(())
     }
 
-    pub fn bind(
+    pub(crate) fn bind(
         &self,
         reactor: &mut Reactor,
         verbose: bool,
         content_handle: ContentHandle,
-    ) -> io::Result<Rc<RefCell<RequestContext>>> {
+    ) -> std::io::Result<Rc<RefCell<RequestContext>>> {
         let actor = Rc::new(RefCell::new(RequestContext::new(
             self.ctr_queue.clone(),
             self.efd,
