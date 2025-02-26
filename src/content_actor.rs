@@ -4,12 +4,12 @@ use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
 use std::rc::Rc;
 
-use crate::{log, syscall};
 use crate::EventReceiver;
 use crate::InterestAction;
 use crate::InterestActions;
 use crate::Reactor;
 use crate::READ_FLAGS;
+use crate::{log, syscall};
 
 use crate::request_context::Handle as ReqHandle;
 use crate::request_context::Message as ReqMessage;
@@ -99,7 +99,6 @@ impl Handle {
 
         Ok(Self { efd, ctr_queue })
     }
-
 
     pub(crate) fn enqueue(&self, msg: Message) -> std::io::Result<()> {
         self.ctr_queue.borrow_mut().push_back(msg);

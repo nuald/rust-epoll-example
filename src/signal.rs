@@ -1,5 +1,5 @@
-use std::os::fd::RawFd;
 use std::mem::MaybeUninit;
+use std::os::fd::RawFd;
 use std::os::raw::c_void;
 
 use crate::syscall;
@@ -24,9 +24,7 @@ impl Listener {
         ))?;
         let fd = syscall!(signalfd(-1, &mask, 0))?;
 
-        Ok(Self {
-            fd,
-        })
+        Ok(Self { fd })
     }
 }
 
@@ -40,7 +38,11 @@ impl EventReceiver for Listener {
     fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
         let mut siginfo = MaybeUninit::<libc::signalfd_siginfo>::uninit();
         let siginfo_size = std::mem::size_of::<libc::signalfd_siginfo>();
-        syscall!(read(fd, siginfo.as_mut_ptr().cast::<c_void>(), siginfo_size))?;
+        syscall!(read(
+            fd,
+            siginfo.as_mut_ptr().cast::<c_void>(),
+            siginfo_size
+        ))?;
 
         new_actions.add(InterestAction::Exit);
         Ok(())

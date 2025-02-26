@@ -7,13 +7,13 @@ use std::rc::Rc;
 
 use crate::content_actor::Handle as ContentHandle;
 use crate::content_actor::Message as ContentMessage;
-use crate::{log, syscall};
 use crate::reactor::EventReceiver;
 use crate::reactor::InterestAction;
 use crate::reactor::InterestActions;
 use crate::reactor::Reactor;
 use crate::reactor::READ_FLAGS;
 use crate::reactor::WRITE_FLAGS;
+use crate::{log, syscall};
 
 const HTTP_RESP: &[u8] = br"HTTP/1.1 200 OK
 content-type: text/html
@@ -143,7 +143,6 @@ impl EventReceiver for RequestContext {
                 log(&format!("could not answer to fd {fd}: {e}"));
             }
         }
-        syscall!(shutdown(fd, libc::SHUT_RDWR))?;
         new_actions.add(InterestAction::Remove(fd));
         Ok(())
     }

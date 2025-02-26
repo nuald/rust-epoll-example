@@ -1,6 +1,6 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::{log, syscall};
@@ -97,7 +97,6 @@ impl Reactor {
     }
 
     fn remove_interest(&mut self, fd: RawFd) -> std::io::Result<()> {
-        println!("remove Interest {fd}");
         syscall!(epoll_ctl(
             self.epoll_fd,
             libc::EPOLL_CTL_DEL,

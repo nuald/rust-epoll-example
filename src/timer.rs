@@ -25,15 +25,8 @@ impl Listener {
                 tv_nsec: 0,
             },
         };
-        syscall!(timerfd_settime(
-            fd,
-            0,
-            &timer_spec,
-            std::ptr::null_mut()
-        ))?;
-        Ok(Self {
-            fd,
-        })
+        syscall!(timerfd_settime(fd, 0, &timer_spec, std::ptr::null_mut()))?;
+        Ok(Self { fd })
     }
 }
 
@@ -47,7 +40,11 @@ impl EventReceiver for Listener {
     fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
         let mut expire_num = MaybeUninit::<u64>::uninit();
         let expire_num_size = std::mem::size_of::<u64>();
-        syscall!(read(fd, expire_num.as_mut_ptr().cast::<c_void>(), expire_num_size))?;
+        syscall!(read(
+            fd,
+            expire_num.as_mut_ptr().cast::<c_void>(),
+            expire_num_size
+        ))?;
 
         new_actions.add(InterestAction::PrintStats);
         new_actions.add(InterestAction::Modify(self.fd, READ_FLAGS));
