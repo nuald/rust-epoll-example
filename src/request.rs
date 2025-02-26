@@ -9,6 +9,7 @@ use crate::reactor::EventReceiver;
 use crate::reactor::InterestAction;
 use crate::reactor::InterestActions;
 use crate::reactor::READ_FLAGS;
+use crate::reactor::State;
 use crate::request_context::RequestContext;
 
 pub struct Listener {
@@ -33,7 +34,8 @@ impl Listener {
 }
 
 impl EventReceiver for Listener {
-    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+    fn on_ready(&mut self, ready_to: State, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+        debug_assert!(ready_to.read());
         match self.file.accept() {
             Ok((stream, addr)) => {
                 stream.set_nonblocking(true)?;
@@ -53,10 +55,6 @@ impl EventReceiver for Listener {
             }
         };
         new_actions.add(InterestAction::Modify(self.file.as_raw_fd(), READ_FLAGS));
-        Ok(())
-    }
-
-    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> std::io::Result<()> {
         Ok(())
     }
 }

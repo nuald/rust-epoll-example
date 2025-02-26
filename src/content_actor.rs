@@ -9,6 +9,7 @@ use crate::InterestAction;
 use crate::InterestActions;
 use crate::Reactor;
 use crate::READ_FLAGS;
+use crate::reactor::State;
 use crate::{log, syscall};
 
 use crate::request_context::Handle as ReqHandle;
@@ -71,17 +72,14 @@ impl Actor {
 }
 
 impl EventReceiver for Actor {
-    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+    fn on_ready(&mut self, ready_to: State, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+        debug_assert!(ready_to.read());
         let mut value = MaybeUninit::<u64>::uninit();
         syscall!(eventfd_read(fd, value.as_mut_ptr()))?;
         for msg in self.ctr_queue.borrow_mut().drain(..) {
             self.handle_message(msg)?;
         }
         new_actions.add(InterestAction::Modify(fd, READ_FLAGS));
-        Ok(())
-    }
-
-    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> std::io::Result<()> {
         Ok(())
     }
 }

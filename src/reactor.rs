@@ -5,9 +5,34 @@ use std::rc::Rc;
 
 use crate::{log, syscall};
 
+pub struct State(i32);
+
+impl State {
+    #[inline]
+    #[must_use]
+    pub fn read(&self) -> bool {
+        self.0 & libc::EPOLLIN != 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn write(&self) -> bool {
+        self.0 & libc::EPOLLOUT != 0
+    }
+
+    #[inline]
+    fn action(&self) -> bool {
+        self.0 & (libc::EPOLLOUT | libc::EPOLLIN) != 0
+    }
+
+    #[inline]
+    fn shutdown(&self) -> bool {
+        self.0 & (libc::EPOLLRDHUP | libc::EPOLLPRI | libc::EPOLLERR | libc::EPOLLHUP) != 0
+    }
+}
+
 pub trait EventReceiver {
-    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()>;
-    fn on_write(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()>;
+    fn on_ready(&mut self, ready_to: State, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()>;
 }
 
 pub const READ_FLAGS: i32 = libc::EPOLLONESHOT | libc::EPOLLIN;
@@ -147,37 +172,21 @@ impl Reactor {
             for ev in &events {
                 let fd = ev.u64 as RawFd;
                 #[allow(clippy::cast_possible_wrap)]
-                let events = ev.events as i32;
-                match events {
-                    v if v & libc::EPOLLIN == libc::EPOLLIN => match self.receivers.get(&fd) {
+                let ready_to = State(ev.events as i32);
+                if ready_to.action() {
+                    match self.receivers.get(&fd) {
                         Some(receiver) => {
-                            receiver.borrow_mut().on_read(fd, &mut interest_actions)?;
+                            receiver.borrow_mut().on_ready(ready_to, fd, &mut interest_actions)?;
                         }
                         None => {
                             if verbose {
                                 log(&format!("unexpected fd {fd} for EPOLLIN"));
                             }
                         }
-                    },
-                    v if v & libc::EPOLLOUT == libc::EPOLLOUT => match self.receivers.get(&fd) {
-                        Some(receiver) => {
-                            receiver.borrow_mut().on_write(fd, &mut interest_actions)?;
-                        }
-                        None => {
-                            if verbose {
-                                log(&format!("unexpected fd {fd} for EPOLLIN"));
-                            }
-                        }
-                    },
-                    v if v & libc::EPOLLOUT == libc::EPOLLOUT => {
-                        self.remove_interest(fd)?;
                     }
-                    v => {
-                        if verbose {
-                            log(&format!("unexpected events: {v}"));
-                        }
-                    }
-                };
+                } else if ready_to.shutdown() {
+                    self.remove_interest(fd)?;
+                }
             }
             if self.apply(interest_actions)? {
                 break Ok(());

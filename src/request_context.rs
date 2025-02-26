@@ -13,6 +13,7 @@ use crate::reactor::InterestActions;
 use crate::reactor::Reactor;
 use crate::reactor::READ_FLAGS;
 use crate::reactor::WRITE_FLAGS;
+use crate::reactor::State;
 use crate::{log, syscall};
 
 const HTTP_RESP: &[u8] = br"HTTP/1.1 200 OK
@@ -87,9 +88,7 @@ impl RequestContext {
             }
         }
     }
-}
 
-impl EventReceiver for RequestContext {
     fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
         if fd == self.efd {
             // Control message
@@ -131,7 +130,7 @@ impl EventReceiver for RequestContext {
         Ok(())
     }
 
-    fn on_write(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+    fn on_write(&mut self, fd: RawFd, new_actions: &mut InterestActions) {
         let res = unsafe { libc::write(fd, HTTP_RESP.as_ptr().cast::<c_void>(), HTTP_RESP.len()) };
         if res > 0 {
             if self.verbose {
@@ -144,6 +143,16 @@ impl EventReceiver for RequestContext {
             }
         }
         new_actions.add(InterestAction::Remove(fd));
+    }
+}
+
+impl EventReceiver for RequestContext {
+    fn on_ready(&mut self, ready_to: State, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+        if ready_to.read() {
+            self.on_read(fd, new_actions)?;
+        } else if ready_to.write() {
+            self.on_write(fd, new_actions);
+        }
         Ok(())
     }
 }

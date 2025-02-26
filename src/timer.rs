@@ -7,6 +7,7 @@ use crate::EventReceiver;
 use crate::InterestAction;
 use crate::InterestActions;
 use crate::READ_FLAGS;
+use crate::reactor::State;
 
 pub struct Listener {
     pub fd: RawFd,
@@ -37,7 +38,8 @@ impl Drop for Listener {
 }
 
 impl EventReceiver for Listener {
-    fn on_read(&mut self, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+    fn on_ready(&mut self, ready_to: State, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+        debug_assert!(ready_to.read());
         let mut expire_num = MaybeUninit::<u64>::uninit();
         let expire_num_size = std::mem::size_of::<u64>();
         syscall!(read(
@@ -48,10 +50,6 @@ impl EventReceiver for Listener {
 
         new_actions.add(InterestAction::PrintStats);
         new_actions.add(InterestAction::Modify(self.fd, READ_FLAGS));
-        Ok(())
-    }
-
-    fn on_write(&mut self, fd: RawFd, _new_actions: &mut InterestActions) -> std::io::Result<()> {
         Ok(())
     }
 }
