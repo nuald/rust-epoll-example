@@ -31,22 +31,27 @@ impl State {
     }
 }
 
-pub trait EventReceiver {
-    fn on_ready(&mut self, ready_to: State, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()>;
+pub(crate) trait EventReceiver {
+    fn on_ready(
+        &mut self,
+        ready_to: State,
+        fd: RawFd,
+        new_actions: &mut InterestActions,
+    ) -> std::io::Result<()>;
 }
 
-pub const READ_FLAGS: i32 = libc::EPOLLONESHOT | libc::EPOLLIN;
-pub const WRITE_FLAGS: i32 = libc::EPOLLONESHOT | libc::EPOLLOUT;
+pub const READ_FLAGS: u32 = (libc::EPOLLONESHOT | libc::EPOLLIN) as _;
+pub const WRITE_FLAGS: u32 = (libc::EPOLLONESHOT | libc::EPOLLOUT) as _;
 
-pub enum InterestAction {
-    Add(RawFd, i32, Rc<RefCell<dyn EventReceiver>>),
-    Modify(RawFd, i32),
+pub(crate) enum InterestAction {
+    Add(RawFd, u32, Rc<RefCell<dyn EventReceiver>>),
+    Modify(RawFd, u32),
     Remove(RawFd),
     Exit,
     PrintStats,
 }
 
-pub struct InterestActions {
+pub(crate) struct InterestActions {
     actions: VecDeque<InterestAction>,
 }
 
@@ -90,11 +95,12 @@ impl Reactor {
     pub(crate) fn add_interest(
         &mut self,
         fd: RawFd,
-        flags: i32,
+        events: u32,
         receiver: Rc<RefCell<dyn EventReceiver>>,
     ) -> std::io::Result<()> {
+        #[allow(clippy::cast_sign_loss)]
         let mut event = libc::epoll_event {
-            events: flags as u32,
+            events,
             u64: fd as u64,
         };
         syscall!(epoll_ctl(
@@ -107,9 +113,10 @@ impl Reactor {
         Ok(())
     }
 
-    fn modify_interest(&self, fd: RawFd, flags: i32) -> std::io::Result<()> {
+    fn modify_interest(&self, fd: RawFd, events: u32) -> std::io::Result<()> {
+        #[allow(clippy::cast_sign_loss)]
         let mut event = libc::epoll_event {
-            events: flags as u32,
+            events,
             u64: fd as u64,
         };
         syscall!(epoll_ctl(
@@ -176,7 +183,9 @@ impl Reactor {
                 if ready_to.action() {
                     match self.receivers.get(&fd) {
                         Some(receiver) => {
-                            receiver.borrow_mut().on_ready(ready_to, fd, &mut interest_actions)?;
+                            receiver
+                                .borrow_mut()
+                                .on_ready(ready_to, fd, &mut interest_actions)?;
                         }
                         None => {
                             if verbose {

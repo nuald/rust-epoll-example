@@ -4,12 +4,12 @@ use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
 use std::rc::Rc;
 
+use crate::reactor::State;
 use crate::EventReceiver;
 use crate::InterestAction;
 use crate::InterestActions;
 use crate::Reactor;
 use crate::READ_FLAGS;
-use crate::reactor::State;
 use crate::{log, syscall};
 
 use crate::request_context::Handle as ReqHandle;
@@ -72,7 +72,12 @@ impl Actor {
 }
 
 impl EventReceiver for Actor {
-    fn on_ready(&mut self, ready_to: State, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+    fn on_ready(
+        &mut self,
+        ready_to: State,
+        fd: RawFd,
+        new_actions: &mut InterestActions,
+    ) -> std::io::Result<()> {
         debug_assert!(ready_to.read());
         let mut value = MaybeUninit::<u64>::uninit();
         syscall!(eventfd_read(fd, value.as_mut_ptr()))?;

@@ -11,9 +11,9 @@ use crate::reactor::EventReceiver;
 use crate::reactor::InterestAction;
 use crate::reactor::InterestActions;
 use crate::reactor::Reactor;
+use crate::reactor::State;
 use crate::reactor::READ_FLAGS;
 use crate::reactor::WRITE_FLAGS;
-use crate::reactor::State;
 use crate::{log, syscall};
 
 const HTTP_RESP: &[u8] = br"HTTP/1.1 200 OK
@@ -103,6 +103,7 @@ impl RequestContext {
             let mut buf = [0u8; 4096];
             let res = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<c_void>(), buf.len()) };
             if res >= 0 {
+                #[allow(clippy::cast_sign_loss)]
                 let sz = res as usize;
                 self.buf
                     .entry(fd)
@@ -114,6 +115,7 @@ impl RequestContext {
 
             match self.content_length.borrow().get(&fd) {
                 None => {
+                    #[allow(clippy::cast_sign_loss)]
                     let sz = res as usize;
                     let data = String::from_utf8_lossy(&buf[..sz]).into_owned();
                     self.content_handle
@@ -147,7 +149,12 @@ impl RequestContext {
 }
 
 impl EventReceiver for RequestContext {
-    fn on_ready(&mut self, ready_to: State, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+    fn on_ready(
+        &mut self,
+        ready_to: State,
+        fd: RawFd,
+        new_actions: &mut InterestActions,
+    ) -> std::io::Result<()> {
         if ready_to.read() {
             self.on_read(fd, new_actions)?;
         } else if ready_to.write() {

@@ -2,12 +2,12 @@ use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
 use std::os::raw::c_void;
 
+use crate::reactor::State;
 use crate::syscall;
 use crate::EventReceiver;
 use crate::InterestAction;
 use crate::InterestActions;
 use crate::READ_FLAGS;
-use crate::reactor::State;
 
 pub struct Listener {
     pub fd: RawFd,
@@ -38,7 +38,12 @@ impl Drop for Listener {
 }
 
 impl EventReceiver for Listener {
-    fn on_ready(&mut self, ready_to: State, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+    fn on_ready(
+        &mut self,
+        ready_to: State,
+        fd: RawFd,
+        new_actions: &mut InterestActions,
+    ) -> std::io::Result<()> {
         debug_assert!(ready_to.read());
         let mut expire_num = MaybeUninit::<u64>::uninit();
         let expire_num_size = std::mem::size_of::<u64>();

@@ -2,11 +2,11 @@ use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
 use std::os::raw::c_void;
 
+use crate::reactor::State;
 use crate::syscall;
 use crate::EventReceiver;
 use crate::InterestAction;
 use crate::InterestActions;
-use crate::reactor::State;
 
 pub struct Listener {
     pub fd: RawFd,
@@ -36,7 +36,12 @@ impl Drop for Listener {
 }
 
 impl EventReceiver for Listener {
-    fn on_ready(&mut self, ready_to: State, fd: RawFd, new_actions: &mut InterestActions) -> std::io::Result<()> {
+    fn on_ready(
+        &mut self,
+        ready_to: State,
+        fd: RawFd,
+        new_actions: &mut InterestActions,
+    ) -> std::io::Result<()> {
         debug_assert!(ready_to.read());
         let mut siginfo = MaybeUninit::<libc::signalfd_siginfo>::uninit();
         let siginfo_size = std::mem::size_of::<libc::signalfd_siginfo>();

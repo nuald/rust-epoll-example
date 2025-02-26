@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
 pub mod content_actor;
@@ -53,11 +52,7 @@ fn main() -> std::io::Result<()> {
     content_handle.bind(&mut reactor, verbose, req_handle)?;
 
     let listener = request::Listener::new(verbose, req_actor)?;
-    reactor.add_interest(
-        listener.file.as_raw_fd(),
-        READ_FLAGS,
-        Rc::new(RefCell::new(listener)),
-    )?;
+    reactor.add_interest(listener.fd, READ_FLAGS, Rc::new(RefCell::new(listener)))?;
 
     let signal_listener = signal::Listener::new()?;
     reactor.add_interest(
