@@ -5,11 +5,7 @@ use std::os::fd::IntoRawFd;
 use std::os::unix::io::RawFd;
 use std::rc::Rc;
 
-use crate::reactor::EventReceiver;
-use crate::reactor::InterestAction;
-use crate::reactor::InterestActions;
-use crate::reactor::State;
-use crate::reactor::READ_FLAGS;
+use crate::reactor::{EventReceiver, InterestAction, InterestActions, State, READ};
 use crate::request_context::RequestContext;
 use crate::{log, syscall};
 
@@ -28,7 +24,7 @@ fn set_nonblocking(fd: RawFd, nonblocking: bool) -> std::io::Result<()> {
 }
 
 pub struct Listener {
-    pub fd: RawFd,
+    fd: RawFd,
     verbose: bool,
     req_actor: Rc<RefCell<RequestContext>>,
 }
@@ -47,6 +43,9 @@ impl Listener {
             req_actor,
         })
     }
+
+    #[inline]
+    pub(crate) fn raw_fd(&self) -> RawFd { self.fd }
 }
 
 impl Drop for Listener {
@@ -70,10 +69,10 @@ impl EventReceiver for Listener {
         set_nonblocking(accepted_socket, true)?;
         new_actions.add(InterestAction::Add(
             accepted_socket,
-            READ_FLAGS,
+            READ,
             self.req_actor.clone(),
         ));
-        new_actions.add(InterestAction::Modify(fd, READ_FLAGS));
+        new_actions.add(InterestAction::Modify(fd, READ));
         Ok(())
     }
 }

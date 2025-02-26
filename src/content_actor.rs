@@ -4,13 +4,8 @@ use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
 use std::rc::Rc;
 
-use crate::reactor::State;
-use crate::EventReceiver;
-use crate::InterestAction;
-use crate::InterestActions;
-use crate::Reactor;
-use crate::READ_FLAGS;
 use crate::{log, syscall};
+use crate::reactor::{State, EventReceiver, InterestAction, InterestActions, Reactor, READ};
 
 use crate::request_context::Handle as ReqHandle;
 use crate::request_context::Message as ReqMessage;
@@ -84,7 +79,7 @@ impl EventReceiver for Actor {
         for msg in self.ctr_queue.borrow_mut().drain(..) {
             self.handle_message(msg)?;
         }
-        new_actions.add(InterestAction::Modify(fd, READ_FLAGS));
+        new_actions.add(InterestAction::Modify(fd, READ));
         Ok(())
     }
 }
@@ -116,7 +111,7 @@ impl Handle {
         req_handle: ReqHandle,
     ) -> std::io::Result<()> {
         let actor = Actor::new(self.ctr_queue.clone(), verbose, req_handle);
-        reactor.add_interest(self.efd, READ_FLAGS, Rc::new(RefCell::new(actor)))?;
+        reactor.add_interest(self.efd, READ, Rc::new(RefCell::new(actor)))?;
         Ok(())
     }
 }

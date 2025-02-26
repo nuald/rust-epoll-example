@@ -2,15 +2,11 @@ use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
 use std::os::raw::c_void;
 
-use crate::reactor::State;
 use crate::syscall;
-use crate::EventReceiver;
-use crate::InterestAction;
-use crate::InterestActions;
-use crate::READ_FLAGS;
+use crate::reactor::{State, EventReceiver, InterestAction, InterestActions, READ};
 
 pub struct Listener {
-    pub fd: RawFd,
+    fd: RawFd,
 }
 
 impl Listener {
@@ -29,6 +25,9 @@ impl Listener {
         syscall!(timerfd_settime(fd, 0, &timer_spec, std::ptr::null_mut()))?;
         Ok(Self { fd })
     }
+
+    #[inline]
+    pub(crate) fn raw_fd(&self) -> RawFd { self.fd }
 }
 
 impl Drop for Listener {
@@ -54,7 +53,7 @@ impl EventReceiver for Listener {
         ))?;
 
         new_actions.add(InterestAction::PrintStats);
-        new_actions.add(InterestAction::Modify(self.fd, READ_FLAGS));
+        new_actions.add(InterestAction::Modify(self.fd, READ));
         Ok(())
     }
 }

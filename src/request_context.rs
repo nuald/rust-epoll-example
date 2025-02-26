@@ -7,13 +7,7 @@ use std::rc::Rc;
 
 use crate::content_actor::Handle as ContentHandle;
 use crate::content_actor::Message as ContentMessage;
-use crate::reactor::EventReceiver;
-use crate::reactor::InterestAction;
-use crate::reactor::InterestActions;
-use crate::reactor::Reactor;
-use crate::reactor::State;
-use crate::reactor::READ_FLAGS;
-use crate::reactor::WRITE_FLAGS;
+use crate::reactor::{EventReceiver, InterestAction, InterestActions, Reactor, State, READ, WRITE};
 use crate::{log, syscall};
 
 const HTTP_RESP: &[u8] = br"HTTP/1.1 200 OK
@@ -76,9 +70,9 @@ impl RequestContext {
                     if self.verbose {
                         log(&format!("got all data: {} bytes", buf.len()));
                     }
-                    new_actions.add(InterestAction::Modify(fd, WRITE_FLAGS));
+                    new_actions.add(InterestAction::Modify(fd, WRITE));
                 } else {
-                    new_actions.add(InterestAction::Modify(fd, READ_FLAGS));
+                    new_actions.add(InterestAction::Modify(fd, READ));
                 }
             }
             None => {
@@ -97,7 +91,7 @@ impl RequestContext {
             for msg in self.ctr_queue.borrow_mut().drain(..) {
                 self.handle_message(&msg, new_actions);
             }
-            new_actions.add(InterestAction::Modify(fd, READ_FLAGS));
+            new_actions.add(InterestAction::Modify(fd, READ));
         } else {
             // TCP request
             let mut buf = [0u8; 4096];
@@ -196,7 +190,7 @@ impl Handle {
             verbose,
             content_handle,
         )));
-        reactor.add_interest(self.efd, READ_FLAGS, actor.clone())?;
+        reactor.add_interest(self.efd, READ, actor.clone())?;
         Ok(actor)
     }
 }

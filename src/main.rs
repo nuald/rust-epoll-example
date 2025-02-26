@@ -8,11 +8,7 @@ pub mod request_context;
 pub mod signal;
 pub mod timer;
 
-use crate::reactor::EventReceiver;
-use crate::reactor::InterestAction;
-use crate::reactor::InterestActions;
-use crate::reactor::Reactor;
-use crate::reactor::READ_FLAGS;
+use crate::reactor::{EventReceiver, InterestAction, InterestActions, Reactor, READ};
 
 #[macro_export]
 macro_rules! syscall {
@@ -52,19 +48,19 @@ fn main() -> std::io::Result<()> {
     content_handle.bind(&mut reactor, verbose, req_handle)?;
 
     let listener = request::Listener::new(verbose, req_actor)?;
-    reactor.add_interest(listener.fd, READ_FLAGS, Rc::new(RefCell::new(listener)))?;
+    reactor.add_interest(listener.raw_fd(), READ, Rc::new(RefCell::new(listener)))?;
 
     let signal_listener = signal::Listener::new()?;
     reactor.add_interest(
-        signal_listener.fd,
-        READ_FLAGS,
+        signal_listener.raw_fd(),
+        READ,
         Rc::new(RefCell::new(signal_listener)),
     )?;
 
     let timer_listener = timer::Listener::new()?;
     reactor.add_interest(
-        timer_listener.fd,
-        READ_FLAGS,
+        timer_listener.raw_fd(),
+        READ,
         Rc::new(RefCell::new(timer_listener)),
     )?;
 

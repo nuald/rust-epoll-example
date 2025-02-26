@@ -9,7 +9,7 @@ use crate::InterestAction;
 use crate::InterestActions;
 
 pub struct Listener {
-    pub fd: RawFd,
+    fd: RawFd,
 }
 
 impl Listener {
@@ -27,6 +27,9 @@ impl Listener {
 
         Ok(Self { fd })
     }
+
+    #[inline]
+    pub(crate) fn raw_fd(&self) -> RawFd { self.fd }
 }
 
 impl Drop for Listener {

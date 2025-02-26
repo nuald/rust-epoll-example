@@ -40,8 +40,8 @@ pub(crate) trait EventReceiver {
     ) -> std::io::Result<()>;
 }
 
-pub const READ_FLAGS: u32 = (libc::EPOLLONESHOT | libc::EPOLLIN) as _;
-pub const WRITE_FLAGS: u32 = (libc::EPOLLONESHOT | libc::EPOLLOUT) as _;
+pub const READ: u32 = (libc::EPOLLONESHOT | libc::EPOLLIN) as _;
+pub const WRITE: u32 = (libc::EPOLLONESHOT | libc::EPOLLOUT) as _;
 
 pub(crate) enum InterestAction {
     Add(RawFd, u32, Rc<RefCell<dyn EventReceiver>>),
