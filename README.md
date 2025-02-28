@@ -18,4 +18,4 @@ requests in flight: 6
 ...
 ```
 
-and you'll also see, that the response times stay constant, which means we're handling multple requests concurrently.
+and you'll also see, that the response times stay constant, which means we're handling multiple requests concurrently.

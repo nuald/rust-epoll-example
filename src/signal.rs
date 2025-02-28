@@ -47,7 +47,7 @@ impl EventReceiver for Listener {
     ) -> std::io::Result<()> {
         debug_assert!(ready_to.read());
         let mut siginfo = MaybeUninit::<libc::signalfd_siginfo>::uninit();
-        let siginfo_size = std::mem::size_of::<libc::signalfd_siginfo>();
+        let siginfo_size = size_of::<libc::signalfd_siginfo>();
         syscall!(read(
             fd,
             siginfo.as_mut_ptr().cast::<c_void>(),

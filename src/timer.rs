@@ -45,7 +45,7 @@ impl EventReceiver for Listener {
     ) -> std::io::Result<()> {
         debug_assert!(ready_to.read());
         let mut expire_num = MaybeUninit::<u64>::uninit();
-        let expire_num_size = std::mem::size_of::<u64>();
+        let expire_num_size = size_of::<u64>();
         syscall!(read(
             fd,
             expire_num.as_mut_ptr().cast::<c_void>(),
